@@ -111,11 +111,11 @@ def translate_keywords_to_japanese(keywords: list[str]) -> list[str]:
                 {"role": "user", "content": keywords_text}]
 
     try:
-        # gpt-5-nano is strict: send only model, messages, max_tokens
+        # Use max_completion_tokens for newer models
         resp = client.chat.completions.create(
             model=model,
             messages=messages,
-            max_tokens=200
+            max_completion_tokens=400
         )
         content = resp.choices[0].message.content.strip()
         print(f"Translation response: {content}")  # Debug
@@ -271,24 +271,26 @@ def parse_retrieval_output(output):
     lines = output.split('\n')
 
     for i, line in enumerate(lines):
-        # Look for lines like: "1) Tech Enthusiasts 25-34"
-        match = re.match(r'(\d+)\)\s+(.+)', line.strip())
+        # Look for lines like: "1) Tech Enthusiasts 25-34 (75.2%)" or "1) Tech Enthusiasts 25-34"
+        match = re.match(r'(\d+)\)\s+(.+?)(?:\s*\(([\d.]+)%\))?\s*$', line.strip())
         if match:
             segment_name = match.group(2)
-
-            # Look for the next line with scores
-            if i + 1 < len(lines):
+            match_percent = float(match.group(3)) if match.group(3) else None
+            
+            # If no percentage in the line, look for it in the next line
+            if match_percent is None and i + 1 < len(lines):
                 score_line = lines[i + 1]
-                # Parse: "   • score: 0.891  |  match: 89.1%  |  est CTR: 2.41%"
+                # Parse various formats: "match: 89.1%" or "• match: 89.1%"
                 score_match = re.search(r'match:\s*([\d.]+)%', score_line)
-
                 if score_match:
                     match_percent = float(score_match.group(1))
-                    japanese_segment_name = get_japanese_name(segment_name)
-                    segments.append({
-                        'name': japanese_segment_name,
-                        'match_percent': match_percent
-                    })
+
+            # Add segment even if no percentage found (for compatibility)
+            japanese_segment_name = get_japanese_name(segment_name)
+            segments.append({
+                'name': japanese_segment_name,
+                'match_percent': match_percent or 0.0
+            })
     return segments
 
 def parse_full_output(output, brief=""):
@@ -306,19 +308,42 @@ def parse_full_output(output, brief=""):
 
     return segments, generated_segments
 
-def parse_generated_segments(markdown_text, brief=""):
-    """Parse the generated segments from markdown output"""
+def parse_generated_segments(output_text, brief=""):
+    """Parse the generated segments from JSON output"""
     segments = []
 
-    print(f"Parsing markdown text: {markdown_text[:500]}...")  # Debug
+    print(f"Parsing output text: {output_text[:500]}...")  # Debug
 
-    # Split by segment markers - look for **Segment N:** pattern
-    segment_blocks = re.split(r'\*\*Segment \d+:', markdown_text)
+    # Try to parse as JSON first (new format)
+    try:
+        # Look for JSON array in the output
+        json_match = re.search(r'\[[\s\S]*\]', output_text)
+        if json_match:
+            json_text = json_match.group(0)
+            data = json.loads(json_text)
+            
+            print(f"Found JSON with {len(data)} segments")  # Debug
+            
+            for item in data:
+                if isinstance(item, dict):
+                    segment = {
+                        'name': item.get('segment_name', ''),
+                        'why_fits': item.get('why_it_fits', ''),
+                        'keywords': item.get('keywords', [])
+                    }
+                    segments.append(segment)
+                    print(f"Parsed JSON segment: {segment['name']}")  # Debug
+            
+            return segments
+    except Exception as e:
+        print(f"JSON parsing failed: {e}, trying markdown fallback")  # Debug
 
-    print(f"Found {len(segment_blocks)} segment blocks")  # Debug
+    # Fallback to markdown parsing (old format)
+    segment_blocks = re.split(r'\*\*Segment \d+:', output_text)
+    print(f"Found {len(segment_blocks)} markdown blocks")  # Debug
 
     for i, block in enumerate(segment_blocks[1:], 1):  # Skip first empty part
-        print(f"Processing block {i}: {block[:200]}...")  # Debug
+        print(f"Processing markdown block {i}: {block[:200]}...")  # Debug
 
         segment = {}
 
@@ -338,14 +363,16 @@ def parse_generated_segments(markdown_text, brief=""):
         keywords_match = re.search(r'\*\*Keywords:\*\*\s*([^\*]+?)(?=\*\*|$)', block, re.DOTALL)
         if keywords_match:
             keywords_text = keywords_match.group(1).strip()
-            # Try comma-separated first
-            keywords = [kw.strip() for kw in keywords_text.split(',') if kw.strip()]
+            # Try Japanese comma first, then regular comma
+            keywords = [kw.strip() for kw in keywords_text.split('、') if kw.strip()]
+            if len(keywords) <= 1:
+                keywords = [kw.strip() for kw in keywords_text.split(',') if kw.strip()]
             # If no commas, try bullet points
             if len(keywords) <= 1:
                 keywords = re.findall(r'[•·-]\s*([^\n]+)', keywords_text)
                 keywords = [kw.strip() for kw in keywords if kw.strip()]
             
-            print(f"Original keywords: {keywords}")  # Debug
+            print(f"Original markdown keywords: {keywords}")  # Debug
 
             # Only translate if keywords are in English
             if keywords and any(re.search(r'[a-zA-Z]', kw) for kw in keywords):
@@ -359,7 +386,7 @@ def parse_generated_segments(markdown_text, brief=""):
             else:
                 segment['keywords'] = keywords
 
-        print(f"Parsed segment: {segment}")  # Debug
+        print(f"Parsed markdown segment: {segment}")  # Debug
 
         # Only add segment if it has essential fields
         if segment.get('name') and (segment.get('why_fits') or segment.get('keywords')):
@@ -370,7 +397,7 @@ def parse_generated_segments(markdown_text, brief=""):
     # If no segments were parsed, try alternative parsing
     if not segments:
         print("No segments found with standard parsing, trying alternative method...")
-        segments = parse_segments_alternative(markdown_text)
+        segments = parse_segments_alternative(output_text)
     
     return segments
 
